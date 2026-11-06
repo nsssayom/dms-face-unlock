@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>dms-face-unlock</vendor>
+
+  <!-- Viewing status and running a match test: no password in your active local session. -->
+  <action id="io.github.nsssayom.dmsfaceunlock.read">
+    <description>View Face Unlock status and test recognition</description>
+    <message>Face Unlock needs to read its status</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/dms-face-unlock/faceunlock-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">read</annotate>
+  </action>
+
+  <!-- Changing faces or settings: always proves it's you, then stays unlocked briefly. -->
+  <action id="io.github.nsssayom.dmsfaceunlock.manage">
+    <description>Change Face Unlock faces and settings</description>
+    <message>Enter your password to change Face Unlock</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/dms-face-unlock/faceunlock-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">manage</annotate>
+  </action>
+</policyconfig>

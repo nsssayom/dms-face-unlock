@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+#
+# Privileged helper for the Face Unlock plugin. Runs as root through pkexec.
+#
+#   faceunlock-helper read status|test
+#   faceunlock-helper manage add LABEL | remove ID | clear | enable | disable
+#   faceunlock-helper manage set KEY VALUE | lock-enable | lock-disable
+#
+# The polkit policy maps the first argument to an action: "read" needs no
+# password in an active local session, "manage" asks for an admin password.
+#
+# Rules this script relies on:
+#   - The target user always comes from PKEXEC_UID, never from an argument.
+#   - Every value is checked against an allowlist before it reaches Howdy.
+#   - It only ever edits a PAM file carrying its own marker.
+#
+# Every command prints one JSON object: {"ok":true,"data":...} or {"ok":false,"error":"..."}.
+
+set -euo pipefail
+export PATH=/usr/bin:/bin
+export LC_ALL=C
+umask 077
+
+readonly CONFIG="${FACEUNLOCK_CONFIG:-/etc/howdy/config.ini}"
+readonly PAM_DIR="${FACEUNLOCK_PAM_DIR:-/etc/pam.d}"
+readonly COMPARE="${FACEUNLOCK_COMPARE:-/usr/lib/howdy/howdy-compare}"
+readonly HOWDY="${FACEUNLOCK_HOWDY:-/usr/bin/howdy}"
+readonly V4L_BY_ID="${FACEUNLOCK_V4L_BY_ID:-/dev/v4l/by-id}"
+readonly LOCK_PAM="$PAM_DIR/dankshell"
+readonly MARKER="# Managed by dms-face-unlock"
+readonly HELPER_VERSION=1
+
+tmp_config=""
+cleanup() { [[ -z $tmp_config ]] || rm -f -- "$tmp_config"; }
+trap cleanup EXIT
+
+reply_ok() { jq -cn --argjson data "${1:-null}" '{ok:true,data:$data}'; }
+
+die() {
+    jq -cn --arg error "$1" '{ok:false,error:$error}'
+    exit "${2:-1}"
+}
+
+resolve_user() {
+    [[ $EUID -eq 0 ]] || die "The helper must run as root."
+    [[ ${PKEXEC_UID:-} =~ ^[0-9]+$ ]] || die "The helper must be started through pkexec."
+    local name
+    name=$(getent passwd "$PKEXEC_UID" | cut -d: -f1) || true
+    [[ -n $name ]] || die "Unknown user."
+    printf '%s' "$name"
+}
+
+config_value() {
+    awk -F= -v key="$1" '
+        /^[[:space:]]*[#;]/ { next }
+        {
+            k = $1; gsub(/[[:space:]]/, "", k)
+            if (k == key) {
+                v = $2; sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                print v; exit
+            }
+        }' "$CONFIG"
+}
+
+# A PAM service uses Howdy when an uncommented line loads pam_howdy.so.
+pam_uses_howdy() {
+    local file="$PAM_DIR/$1"
+    [[ -r $file ]] && grep -Eq '^[[:space:]]*[^#[:space:]].*pam_howdy\.so' "$file"
+}
+
+lock_file_state() {
+    if [[ ! -e $LOCK_PAM ]]; then
+        printf 'absent'
+    elif grep -qxF "$MARKER" "$LOCK_PAM"; then
+        printf 'managed'
+    else
+        printf 'custom'
+    fi
+}
+
+models_json() {
+    "$HOWDY" -U "$1" list --plain 2>/dev/null | jq -Rcs '
+        split("\n")
+        | map(select(test("^[0-9]+,")))
+        | map(capture("^(?<id>[0-9]+),(?<date>[^,]*),(?<label>.*)$") | .id |= tonumber)
+    ' || printf '[]'
+}
+
+cameras_json() {
+    local link name
+    for link in "$V4L_BY_ID"/*-video-index0; do
+        [[ -e $link ]] || continue
+        name=$(basename -- "$link")
+        name=${name#usb-}
+        name=${name%-video-index0}
+        jq -cn --arg path "$link" --arg name "$name" --arg node "$(readlink -f -- "$link")" \
+            '{path:$path,name:$name,node:$node}'
+    done | jq -cs '.'
+}
+
+cmd_status() {
+    local user=$1 device device_node="" enrolled
+    [[ -r $CONFIG ]] || die "Howdy's config was not found. Is Howdy installed?"
+    device=$(config_value device_path)
+    [[ -e $device ]] && device_node=$(readlink -f -- "$device")
+    enrolled=$(models_json "$user")
+
+    jq -cn \
+        --argjson version "$HELPER_VERSION" \
+        --arg user "$user" \
+        --arg howdy "$("$HOWDY" version 2>/dev/null | head -1)" \
+        --arg disabled "$(config_value disabled)" \
+        --arg device "$device" \
+        --arg deviceNode "$device_node" \
+        --arg timeout "$(config_value timeout)" \
+        --arg threshold "$(config_value sface_threshold)" \
+        --arg dark "$(config_value dark_threshold)" \
+        --argjson models "$enrolled" \
+        --argjson cameras "$(cameras_json)" \
+        --arg lockState "$(lock_file_state)" \
+        --argjson lock "$(pam_uses_howdy dankshell && echo true || echo false)" \
+        --argjson sudo "$(pam_uses_howdy sudo && echo true || echo false)" \
+        --argjson polkit "$(pam_uses_howdy polkit-1 && echo true || echo false)" \
+        --argjson greeter "$(pam_uses_howdy greetd && echo true || echo false)" \
+        '{ok:true,data:{
+            helperVersion:$version, user:$user, howdyVersion:$howdy,
+            enabled:($disabled != "true" and $disabled != "1"),
+            device:$device, deviceNode:$deviceNode,
+            timeout:($timeout|tonumber? // 4),
+            threshold:($threshold|tonumber? // 0),
+            darkThreshold:($dark|tonumber? // 0),
+            models:$models, cameras:$cameras,
+            pam:{lock:$lock, lockState:$lockState, sudo:$sudo, polkit:$polkit, greeter:$greeter}
+        }}'
+}
+
+cmd_test() {
+    local user=$1 output rc=0 started elapsed
+    [[ -r $CONFIG ]] || die "Howdy's config was not found. Is Howdy installed?"
+    tmp_config=$(mktemp "$(dirname -- "$CONFIG")/.faceunlock.XXXXXX")
+    sed -E 's/^([[:space:]]*end_report[[:space:]]*=).*/\1 true/' "$CONFIG" >"$tmp_config"
+    started=$(date +%s%N)
+    output=$("$COMPARE" --config "$tmp_config" "$user" 2>&1) || rc=$?
+    elapsed=$((($(date +%s%N) - started) / 1000000))
+
+    jq -cn \
+        --argjson matched "$([[ $rc -eq 0 ]] && echo true || echo false)" \
+        --argjson rc "$rc" \
+        --argjson ms "$elapsed" \
+        --arg threshold "$(config_value sface_threshold)" \
+        --arg output "$output" \
+        '($output | split("\n")) as $lines
+        | def field($prefix): ($lines | map(select(startswith($prefix))) | first // "" | ltrimstr($prefix));
+        {ok:true,data:{
+            matched:$matched, exitCode:$rc, milliseconds:$ms,
+            threshold:($threshold|tonumber? // 0),
+            score:(field("Winning score: ")|tonumber? // null),
+            model:(field("Winning model: ") | capture("\"(?<l>.*)\"").l? // null),
+            tooDark:($output | test("too dark"; "i")),
+            cameraError:($output | test("(could not|cannot|failed to) open|no such device|device busy"; "i"))
+        }}'
+}
+
+valid_label() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9\ _-]{0,31}$ ]]; }
+
+cmd_add() {
+    local user=$1 label=${2:-}
+    valid_label "$label" || die "Names can use letters, numbers, spaces, - and _, up to 32 characters."
+    local output
+    output=$("$HOWDY" -U "$user" add --plain -y "$label" 2>&1) \
+        || die "$(grep -vE 'WARN|^$' <<<"$output" | tail -1 | cut -c1-200)"
+    reply_ok
+}
+
+cmd_remove() {
+    local user=$1 id=${2:-}
+    [[ $id =~ ^[0-9]{1,4}$ ]] || die "Invalid sample ID."
+    "$HOWDY" -U "$user" remove --plain -y "$id" >/dev/null 2>&1 || die "Could not remove that sample."
+    reply_ok
+}
+
+cmd_clear() {
+    "$HOWDY" -U "$1" clear --plain -y >/dev/null 2>&1 || die "Could not remove the samples."
+    reply_ok
+}
+
+cmd_toggle() {
+    "$HOWDY" disable "$1" >/dev/null 2>&1 || die "Could not change the Face Unlock state."
+    reply_ok
+}
+
+# Decimal in [min, max]; bash can't compare floats, so awk does.
+in_range() {
+    [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,4})?$ ]] || return 1
+    awk -v v="$1" -v a="$2" -v b="$3" 'BEGIN { exit !(v + 0 >= a + 0 && v + 0 <= b + 0) }'
+}
+
+cmd_set() {
+    local key=${1:-} value=${2:-}
+    case $key in
+    timeout)
+        if ! [[ $value =~ ^[0-9]{1,2}$ ]] || ((10#$value < 1 || 10#$value > 15)); then
+            die "Scan time must be 1 to 15 seconds."
+        fi
+        ;;
+    sface_threshold)
+        in_range "$value" 0.5 0.9 || die "Strictness must be between 0.5 and 0.9."
+        ;;
+    dark_threshold)
+        in_range "$value" 0 99.9 || die "Low-light limit must be between 0 and 99.9."
+        ;;
+    device_path)
+        [[ $value == "$V4L_BY_ID"/* && ${value#"$V4L_BY_ID"/} =~ ^[A-Za-z0-9._:-]+$ && -e $value ]] \
+            || die "That camera was not found."
+        ;;
+    *)
+        die "That setting can't be changed from here."
+        ;;
+    esac
+    "$HOWDY" set "$key" "$value" >/dev/null 2>&1 || die "Howdy rejected that value."
+    reply_ok
+}
+
+cmd_lock_enable() {
+    case $(lock_file_state) in
+    custom) die "$LOCK_PAM has custom content, so it was left alone." ;;
+    esac
+    local staged
+    staged=$(mktemp "$PAM_DIR/.dankshell.XXXXXX")
+    cat >"$staged" <<EOF
+#%PAM-1.0
+$MARKER
+# Lock screen: try the face first, then fall back to the password.
+auth      required     pam_env.so
+auth      sufficient   pam_howdy.so
+auth      sufficient   pam_unix.so       try_first_pass nullok
+auth      required     pam_deny.so
+account   required     pam_unix.so
+password  required     pam_deny.so
+session   required     pam_permit.so
+EOF
+    chmod 644 "$staged"
+    mv -f -- "$staged" "$LOCK_PAM"
+    reply_ok
+}
+
+cmd_lock_disable() {
+    case $(lock_file_state) in
+    absent) reply_ok ;;
+    custom) die "$LOCK_PAM has custom content, so it was left alone." ;;
+    managed)
+        rm -f -- "$LOCK_PAM"
+        reply_ok
+        ;;
+    esac
+}
+
+main() {
+    local scope=${1:-} command=${2:-}
+    local user
+    user=$(resolve_user) || {
+        printf '%s\n' "$user"
+        exit 1
+    }
+    case "$scope:$command" in
+    read:status) cmd_status "$user" ;;
+    read:test) cmd_test "$user" ;;
+    manage:add) cmd_add "$user" "${3:-}" ;;
+    manage:remove) cmd_remove "$user" "${3:-}" ;;
+    manage:clear) cmd_clear "$user" ;;
+    manage:enable) cmd_toggle 0 ;;
+    manage:disable) cmd_toggle 1 ;;
+    manage:set) cmd_set "${3:-}" "${4:-}" ;;
+    manage:lock-enable) cmd_lock_enable ;;
+    manage:lock-disable) cmd_lock_disable ;;
+    *) die "Unknown command." 2 ;;
+    esac
+}
+
+main "$@"

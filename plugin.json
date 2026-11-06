@@ -1,0 +1,15 @@
+{
+    "id": "faceUnlock",
+    "name": "Face Unlock",
+    "description": "Manage Howdy face unlock: samples, live camera preview, recognition test, lock screen setup and tuning.",
+    "version": "0.1.0",
+    "author": "nsssayom",
+    "type": "widget",
+    "capabilities": ["control-center", "authentication", "command-execution"],
+    "component": "./FaceUnlockWidget.qml",
+    "settings": "./FaceUnlockSettings.qml",
+    "icon": "face",
+    "requires_dms": ">=2.0.0",
+    "dependencies": ["howdy", "jq", "pkexec"],
+    "permissions": ["settings_read", "settings_write", "process"]
+}
